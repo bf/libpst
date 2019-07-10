@@ -9,9 +9,9 @@
 #include "lzfu.h"
 #include "msg.h"
 
-#define OUTPUT_TEMPLATE "%s"
+#define OUTPUT_TEMPLATE "%s.%s"
 #define OUTPUT_KMAIL_DIR_TEMPLATE ".%s.directory"
-#define KMAIL_INDEX ".%s.index"
+#define KMAIL_INDEX "../.%s.index"
 #define SEP_MAIL_FILE_TEMPLATE "%i%s"
 
 // max size of the c_time char*. It will store the date of the email
@@ -33,7 +33,7 @@ void      write_email_body(FILE *f, char *body);
 void      removeCR(char *c);
 void      usage();
 void      version();
-char*     mk_kmail_dir(char* fname);
+void      mk_kmail_dir(char* fname);
 int       close_kmail_dir();
 void      mk_recurse_dir(char* dir);
 int       close_recurse_dir();
@@ -66,10 +66,10 @@ void      write_journal(FILE* f_output, pst_item* item);
 void      write_appointment(FILE* f_output, pst_item *item);
 void      create_enter_dir(struct file_ll* f, pst_item *item);
 void      close_enter_dir(struct file_ll *f);
+char*     quote_string(char *inp);
 
 const char*  prog_name;
 char*  output_dir = ".";
-char*  kmail_chdir = NULL;
 
 // Normal mode just creates mbox format files in the current directory. Each file is named
 // the same as the folder's name that it represents
@@ -144,6 +144,8 @@ int         max_children  = 0;      // based on number of cpus and command line 
 int         max_child_specified = 0;// have command line arg -j
 int         active_children;        // number of children of this process, cannot be larger than max_children
 pid_t*      child_processes;        // setup by main(), and at the start of new child process
+
+int         mime_boundary_id = 0;
 
 #ifdef HAVE_SEMAPHORE_H
 int         shared_memory_id;
@@ -337,6 +339,10 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
                         // we are the child process, or the original parent if no children were available
                         pid_t me = getpid();
                         mk_separate_file(&ff, PST_TYPE_NOTE, (mode_EX) ? ".eml" : "", 1);
+    
+                        // reset mime boundary id
+                        mime_boundary_id = 0;
+
                         write_normal_email(ff.output[PST_TYPE_NOTE], ff.name[PST_TYPE_NOTE], item, mode, mode_MH, &pstfile, save_rtf_body, PST_TYPE_NOTE, &extra_mime_headers);
                         close_separate_file(&ff);
                         if (mode_MSG) {
@@ -358,6 +364,9 @@ void process(pst_item *outeritem, pst_desc_tree *d_ptr)
                     }
                 }
                 else {
+                    // reset mime boundary id
+                    mime_boundary_id = 0;
+                        
                     // process this single email message, cannot fork since not separate mode
                     write_normal_email(ff.output[PST_TYPE_NOTE], ff.name[PST_TYPE_NOTE], item, mode, mode_MH, &pstfile, save_rtf_body, 0, &extra_mime_headers);
                 }
@@ -761,18 +770,12 @@ void version() {
 }
 
 
-char *mk_kmail_dir(char *fname) {
-    //change to that directory
+void mk_kmail_dir(char *fname) {
     //make a directory based on OUTPUT_KMAIL_DIR_TEMPLATE
-    //allocate space for OUTPUT_TEMPLATE and form a char* with fname
-    //return that value
-    char *dir, *out_name, *index;
+    //change to that directory
+    char *dir, *index;
     int x;
     DEBUG_ENT("mk_kmail_dir");
-    if (kmail_chdir && chdir(kmail_chdir)) {
-        x = errno;
-        DIE(("mk_kmail_dir: Cannot change to directory %s: %s\n", kmail_chdir, strerror(x)));
-    }
     dir = pst_malloc(strlen(fname)+strlen(OUTPUT_KMAIL_DIR_TEMPLATE)+1);
     sprintf(dir, OUTPUT_KMAIL_DIR_TEMPLATE, fname);
     check_filename(dir);
@@ -782,8 +785,10 @@ char *mk_kmail_dir(char *fname) {
             DIE(("mk_kmail_dir: Cannot create directory %s: %s\n", dir, strerror(x)));
         }
     }
-    kmail_chdir = pst_realloc(kmail_chdir, strlen(dir)+1);
-    strcpy(kmail_chdir, dir);
+    if (chdir(dir)) {
+        x = errno;
+        DIE(("mk_kmail_dir: Cannot change to directory %s: %s\n", dir, strerror(x)));
+    }
     free (dir);
 
     //we should remove any existing indexes created by KMail, cause they might be different now
@@ -792,25 +797,16 @@ char *mk_kmail_dir(char *fname) {
     unlink(index);
     free(index);
 
-    out_name = pst_malloc(strlen(fname)+strlen(OUTPUT_TEMPLATE)+1);
-    sprintf(out_name, OUTPUT_TEMPLATE, fname);
     DEBUG_RET();
-    return out_name;
 }
 
 
 int close_kmail_dir() {
-    // change ..
     int x;
     DEBUG_ENT("close_kmail_dir");
-    if (kmail_chdir) { //only free kmail_chdir if not NULL. do not change directory
-        free(kmail_chdir);
-        kmail_chdir = NULL;
-    } else {
-        if (chdir("..")) {
-            x = errno;
-            DIE(("close_kmail_dir: Cannot move up dir (..): %s\n", strerror(x)));
-        }
+    if (chdir("..")) {
+        x = errno;
+        DIE(("close_kmail_dir: Cannot move up dir (..): %s\n", strerror(x)));
     }
     DEBUG_RET();
     return 0;
@@ -874,7 +870,7 @@ void mk_recurse_dir(char *dir) {
             DIE(("mk_recurse_dir: Cannot create directory %s: %s\n", dir, strerror(x)));
         }
     }
-    if (chdir (dir)) {
+    if (chdir(dir)) {
         x = errno;
         DIE(("mk_recurse_dir: Cannot change to directory %s: %s\n", dir, strerror(x)));
     }
@@ -965,7 +961,7 @@ int close_separate_dir() {
 
 void mk_separate_file(struct file_ll *f, int32_t t, char *extension, int openit) {
     DEBUG_ENT("mk_separate_file");
-    DEBUG_INFO(("opening next file to save email\n"));
+    DEBUG_INFO(("opening next file to save email type %s\n", item_type_to_name(t)));
     if (f->item_count > 999999999) { // bigger than nine 9's
         DIE(("mk_separate_file: The number of emails in this folder has become too high to handle\n"));
     }
@@ -1165,6 +1161,32 @@ void write_embedded_message(FILE* f_output, pst_item_attach* attach, char *bound
     DEBUG_RET();
 }
 
+/**
+ * Backslash-escape quotes and backslashes in the given string.
+ */
+char *quote_string(char *inp) {
+    int i = 0;
+    int count = 0;
+    char *curr = inp;
+    while (*curr) {
+        if (*curr == '\"' || *curr == '\\') {
+            count++;
+        }
+        curr++;
+        i++;
+    }
+    char *res = malloc(i + count + 1);
+    char *curr_in = inp;
+    char *curr_out = res;
+    while (*curr_in) {
+        if (*curr_in == '\"' || *curr_in == '\\') {
+            *curr_out++ = '\\';
+        }
+        *curr_out++ = *curr_in++;
+    }
+    *curr_out = '\0';
+    return res;
+}
 
 void write_inline_attachment(FILE* f_output, pst_item_attach* attach, char *boundary, pst_file* pst)
 {
@@ -1196,8 +1218,14 @@ void write_inline_attachment(FILE* f_output, pst_item_attach* attach, char *boun
     if (attach->filename2.str) {
         // use the long filename, converted to proper encoding if needed.
         // it is already utf8
+        char *escaped = quote_string(attach->filename2.str);
         pst_rfc2231(&attach->filename2);
-        fprintf(f_output, "Content-Disposition: attachment; \n        filename*=%s\n\n", attach->filename2.str);
+        fprintf(f_output, "Content-Disposition: attachment; \n        filename*=%s;\n", attach->filename2.str);
+        // Also include the (escaped) utf8 filename in the 'filename' header directly - this is not strictly valid
+        // (since this header should be ASCII) but is almost always handled correctly (and in fact this is the only
+        // way to get MS Outlook to correctly read a UTF8 filename, AFAICT, which is why we're doing it).
+        fprintf(f_output, "        filename=\"%s\"\n\n", escaped);
+        free(escaped);
     }
     else if (attach->filename1.str) {
         // short filename never needs encoding
@@ -1569,7 +1597,8 @@ void write_normal_email(FILE* f_output, char f_name[], pst_item* item, int mode,
         c_time = "Thu Jan 1 00:00:00 1970";
 
     // create our MIME boundaries here.
-    snprintf(boundary, sizeof(boundary), "--boundary-LibPST-iamunique-%i_-_-", rand());
+    // snprintf(boundary, sizeof(boundary), "--boundary-LibPST-iamunique-%i_-_-", rand());
+    snprintf(boundary, sizeof(boundary), "--boundary-LibPST-iamunique-%i_-_-", ++mime_boundary_id);
     snprintf(altboundary, sizeof(altboundary), "alt-%s", boundary);
 
     // we will always look at the headers to discover some stuff
@@ -2116,7 +2145,7 @@ void write_appointment(FILE* f_output, pst_item* item)
                 int  empty = 1;
                 int i=0;
                 memset(byday, 0, sizeof(byday));
-                for (i=0; i<6; i++) {
+                for (i=0; i<7; i++) {
                     int bit = 1 << i;
                     if (bit & rdata->bydaymask) {
                         char temp[40];
@@ -2188,9 +2217,16 @@ void create_enter_dir(struct file_ll* f, pst_item *item)
     strcpy(f->dname, item->file_as.str);
 
     DEBUG_ENT("create_enter_dir");
-    if (mode == MODE_KMAIL)
-        f->name[0] = mk_kmail_dir(item->file_as.str);
-    else if (mode == MODE_RECURSE) {
+    if (mode == MODE_KMAIL) {
+        int32_t t;
+        mk_kmail_dir(item->file_as.str);
+        for (t=0; t<PST_TYPE_MAX; t++) {
+            if (t == reduced_item_type(t)) {
+                f->name[t] = (char*) pst_malloc(strlen(item->file_as.str)+strlen(OUTPUT_TEMPLATE)+30);
+                sprintf(f->name[t], OUTPUT_TEMPLATE, item->file_as.str, item_type_to_name(t));
+            }
+        }
+    } else if (mode == MODE_RECURSE) {
         int32_t t;
         mk_recurse_dir(item->file_as.str);
         for (t=0; t<PST_TYPE_MAX; t++) {
@@ -2205,12 +2241,23 @@ void create_enter_dir(struct file_ll* f, pst_item *item)
         }
     } else if (mode == MODE_SEPARATE) {
         // do similar stuff to recurse here.
+        int32_t t;
         mk_separate_dir(item->file_as.str);
-        f->name[0] = (char*) pst_malloc(file_name_len);
-        memset(f->name[0], 0, file_name_len);
+        for (t=0; t<PST_TYPE_MAX; t++) {
+            if (t == reduced_item_type(t)) {
+                f->name[t] = (char*) pst_malloc(file_name_len);
+                memset(f->name[t], 0, file_name_len);
+            }
+        }
     } else {
-        f->name[0] = (char*) pst_malloc(strlen(item->file_as.str)+strlen(OUTPUT_TEMPLATE)+1);
-        sprintf(f->name[0], OUTPUT_TEMPLATE, item->file_as.str);
+        // MODE_NORMAL
+        int32_t t;
+        for (t=0; t<PST_TYPE_MAX; t++) {
+            if (t == reduced_item_type(t)) {
+                f->name[t] = (char*) pst_malloc(strlen(item->file_as.str)+strlen(OUTPUT_TEMPLATE)+30);
+                sprintf(f->name[t], OUTPUT_TEMPLATE, item->file_as.str, item_type_to_name(t));
+            }
+        }
     }
 
     if (mode != MODE_SEPARATE) {
@@ -2225,12 +2272,11 @@ void create_enter_dir(struct file_ll* f, pst_item *item)
                     check_filename(temp);
                     while ((f->output[t] = fopen(temp, "r"))) {
                         DEBUG_INFO(("need to increase filename because one already exists with that name\n"));
-                        DEBUG_INFO(("- increasing it to %s%d\n", f->name, x));
                         x++;
-                        sprintf(temp, "%s%08d", f->name, x);
-                        DEBUG_INFO(("- trying \"%s\"\n", f->name));
+                        sprintf(temp, "%s%08d", f->name[t], x);
+                        DEBUG_INFO(("- bump file name and try \"%s\"\n", temp));
                         if (x == 99999999) {
-                            DIE(("create_enter_dir: Why can I not create a folder %s? I have tried %i extensions...\n", f->name, x));
+                            DIE(("create_enter_dir: Why can I not create a folder %s? I have tried %i extensions...\n", f->name[t], x));
                         }
                         fclose(f->output[t]);
                     }
@@ -2267,17 +2313,19 @@ void close_enter_dir(struct file_ll *f)
     for (t=0; t<PST_TYPE_MAX; t++) {
         if (f->output[t]) {
             if (mode == MODE_SEPARATE) DEBUG_WARN(("close_enter_dir finds open separate file\n"));
-            struct stat st;
             fclose(f->output[t]);
+            f->output[t] = NULL;
+        }
+        if (f->name[t]) {
+            struct stat st;
             stat(f->name[t], &st);
             if (!st.st_size) {
                 DEBUG_WARN(("removing empty output file %s\n", f->name[t]));
                 remove(f->name[t]);
             }
-            f->output[t] = NULL;
+            free(f->name[t]);
+            f->name[t] = NULL;
         }
-        free(f->name[t]);
-        f->name[t] = NULL;
     }
     free(f->dname);
 
