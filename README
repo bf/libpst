@@ -12,3 +12,17 @@ Starting with a mercurial working directory, try this:
     (cd xml; make; make distclean)
     make distcheck
 
+------------
+
+# LibPST on Ubuntu 18.04
+
+For building libpst on a new Ubuntu 18.04 system you need to install the following packages:
+
+    sudo apt-get install build-essentials zlib1g-dev python2.7-dev libtool m4 automake libboost-python-dev libgsf-1-dev doxygen graphviz
+
+Then you can build everything with
+
+    make -f *cvs
+    ./configure
+    make 
+    sudo make install
